@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Bézier Curve with Physics</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #0a0e27;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+        }
+        canvas {
+            display: block;
+            background: radial-gradient(circle at center, #1a1f3a 0%, #0a0e27 100%);
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        #fps {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            color: #0f0;
+        }
+        .highlight {
+            color: #4fc3f7;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="info">
+        <div><span class="highlight">Controls:</span> Move mouse to interact</div>
+        <div><span class="highlight">Physics:</span> Spring-damping model</div>
+        <div><span class="highlight">Math:</span> Cubic Bézier B(t) = Σ</div>
+    </div>
+    <div id="fps">FPS: --</div>
+
+    <script>
+        // Math Module
+        class Vec2 {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+            }
+
+            add(v) {
+                return new Vec2(this.x + v.x, this.y + v.y);
+            }
+
+            sub(v) {
+                return new Vec2(this.x - v.x, this.y - v.y);
+            }
+
+            mul(s) {
+                return new Vec2(this.x * s, this.y * s);
+            }
+
+            length() {
+                return Math.sqrt(this.x * this.x + this.y * this.y);
+            }
+
+            normalize() {
+                const len = this.length();
+                return len > 0 ? new Vec2(this.x / len, this.y / len) : new Vec2(0, 0);
+            }
+        }
+
+        // Cubic Bézier: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+        function bezierPoint(t, p0, p1, p2, p3) {
+            const t2 = t * t;
+            const t3 = t2 * t;
+            const mt = 1 - t;
+            const mt2 = mt * mt;
+            const mt3 = mt2 * mt;
+
+            const x = mt3 * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t3 * p3.x;
+            const y = mt3 * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t3 * p3.y;
+
+            return new Vec2(x, y);
+        }
+
+        // Tangent: B'(t) = 3(1-t)²(P₁-P₀) + 6(1-t)t(P₂-P₁) + 3t²(P₃-P₂)
+        function bezierTangent(t, p0, p1, p2, p3) {
+            const mt = 1 - t;
+            const mt2 = mt * mt;
+            const t2 = t * t;
+
+            const d01 = p1.sub(p0);
+            const d12 = p2.sub(p1);
+            const d23 = p3.sub(p2);
+
+            const x = 3 * mt2 * d01.x + 6 * mt * t * d12.x + 3 * t2 * d23.x;
+            const y = 3 * mt2 * d01.y + 6 * mt * t * d12.y + 3 * t2 * d23.y;
+
+            return new Vec2(x, y);
+        }
+
+        // Physics Module
+        class ControlPoint {
+            constructor(x, y, fixed = false) {
+                this.pos = new Vec2(x, y);
+                this.vel = new Vec2(0, 0);
+                this.target = new Vec2(x, y);
+                this.fixed = fixed;
+            }
+
+            // Spring-damping: a = -k(p - target) - damping * v
+            update(dt, k = 2.5, damping = 0.7) {
+                if (this.fixed) return;
+
+                const displacement = this.pos.sub(this.target);
+                const springForce = displacement.mul(-k);
+                const dampingForce = this.vel.mul(-damping);
+                const acc = springForce.add(dampingForce);
+
+                this.vel = this.vel.add(acc.mul(dt));
+                this.pos = this.pos.add(this.vel.mul(dt));
+            }
+
+            setTarget(x, y) {
+                this.target = new Vec2(x, y);
+            }
+        }
+
+        // Rendering Module
+        class BezierRenderer {
+            constructor(canvas) {
+                this.canvas = canvas;
+                this.ctx = canvas.getContext('2d');
+                this.width = window.innerWidth;
+                this.height = window.innerHeight;
+                
+                canvas.width = this.width;
+                canvas.height = this.height;
+
+                // Initialize control points
+                const cx = this.width / 2;
+                const cy = this.height / 2;
+                const offset = 200;
+
+                this.points = [
+                    new ControlPoint(cx - offset, cy, true),  // P0 - fixed
+                    new ControlPoint(cx - offset/3, cy - offset/2),  // P1 - dynamic
+                    new ControlPoint(cx + offset/3, cy + offset/2),  // P2 - dynamic
+                    new ControlPoint(cx + offset, cy, true)   // P3 - fixed
+                ];
+
+                this.tStep = 0.01;
+                this.tangentStep = 0.15;
+                this.tangentLength = 30;
+
+                // FPS tracking
+                this.lastTime = performance.now();
+                this.frameCount = 0;
+                this.fps = 60;
+
+                this.setupInput();
+                this.animate();
+            }
+
+            setupInput() {
+                // Debug: Show mouse position
+                const debugDiv = document.createElement('div');
+                debugDiv.style.position = 'absolute';
+                debugDiv.style.bottom = '20px';
+                debugDiv.style.left = '20px';
+                debugDiv.style.background = 'rgba(0,0,0,0.7)';
+                debugDiv.style.padding = '10px';
+                debugDiv.style.borderRadius = '8px';
+                debugDiv.style.color = '#fff';
+                debugDiv.style.fontFamily = 'monospace';
+                debugDiv.innerHTML = 'Mouse: Move mouse over canvas';
+                document.body.appendChild(debugDiv);
+
+                this.canvas.addEventListener('mousemove', (e) => {
+                    const rect = this.canvas.getBoundingClientRect();
+                    const mouseX = e.clientX - rect.left;
+                    const mouseY = e.clientY - rect.top;
+
+                    debugDiv.innerHTML = `Mouse: (${Math.round(mouseX)}, ${Math.round(mouseY)}) - Move mouse to bend curve`;
+
+                    // Calculate offset from center
+                    const offsetX = (mouseX - this.width / 2) * 0.6;
+                    const offsetY = (mouseY - this.height / 2) * 0.6;
+
+                    // P1 follows mouse with positive offset
+                    const targetX1 = this.width / 2 - 200/3 + offsetX;
+                    const targetY1 = this.height / 2 - 100 + offsetY;
+                    this.points[1].setTarget(targetX1, targetY1);
+
+                    // P2 follows mouse with negative offset (creates wave effect)
+                    const targetX2 = this.width / 2 + 200/3 + offsetX * 0.8;
+                    const targetY2 = this.height / 2 + 100 - offsetY * 0.8;
+                    this.points[2].setTarget(targetX2, targetY2);
+                });
+            }
+
+            clear() {
+                this.ctx.clearRect(0, 0, this.width, this.height);
+            }
+
+            drawCurve() {
+                const p0 = this.points[0].pos;
+                const p1 = this.points[1].pos;
+                const p2 = this.points[2].pos;
+                const p3 = this.points[3].pos;
+
+                // Draw curve with gradient
+                const gradient = this.ctx.createLinearGradient(p0.x, p0.y, p3.x, p3.y);
+                gradient.addColorStop(0, '#ff006e');
+                gradient.addColorStop(0.5, '#8338ec');
+                gradient.addColorStop(1, '#3a86ff');
+
+                this.ctx.beginPath();
+                this.ctx.strokeStyle = gradient;
+                this.ctx.lineWidth = 4;
+                this.ctx.shadowBlur = 20;
+                this.ctx.shadowColor = '#8338ec';
+
+                for (let t = 0; t <= 1; t += this.tStep) {
+                    const pt = bezierPoint(t, p0, p1, p2, p3);
+                    if (t === 0) {
+                        this.ctx.moveTo(pt.x, pt.y);
+                    } else {
+                        this.ctx.lineTo(pt.x, pt.y);
+                    }
+                }
+                this.ctx.stroke();
+                this.ctx.shadowBlur = 0;
+            }
+
+            drawTangents() {
+                const p0 = this.points[0].pos;
+                const p1 = this.points[1].pos;
+                const p2 = this.points[2].pos;
+                const p3 = this.points[3].pos;
+
+                this.ctx.strokeStyle = '#00f5ff';
+                this.ctx.lineWidth = 2;
+                this.ctx.shadowBlur = 10;
+                this.ctx.shadowColor = '#00f5ff';
+
+                for (let t = 0; t <= 1; t += this.tangentStep) {
+                    const pt = bezierPoint(t, p0, p1, p2, p3);
+                    const tangent = bezierTangent(t, p0, p1, p2, p3).normalize();
+                    
+                    const tx = tangent.x * this.tangentLength;
+                    const ty = tangent.y * this.tangentLength;
+
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(pt.x, pt.y);
+                    this.ctx.lineTo(pt.x + tx, pt.y + ty);
+                    this.ctx.stroke();
+
+                    // Draw tangent endpoint
+                    this.ctx.fillStyle = '#00f5ff';
+                    this.ctx.beginPath();
+                    this.ctx.arc(pt.x + tx, pt.y + ty, 3, 0, Math.PI * 2);
+                    this.ctx.fill();
+                }
+                this.ctx.shadowBlur = 0;
+            }
+
+            drawControlPoints() {
+                this.points.forEach((cp, i) => {
+                    // Draw connection lines
+                    if (i < 3) {
+                        this.ctx.beginPath();
+                        this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+                        this.ctx.lineWidth = 1;
+                        this.ctx.moveTo(cp.pos.x, cp.pos.y);
+                        this.ctx.lineTo(this.points[i + 1].pos.x, this.points[i + 1].pos.y);
+                        this.ctx.stroke();
+                    }
+
+                    // Draw control point
+                    this.ctx.fillStyle = cp.fixed ? '#ff006e' : '#ffbe0b';
+                    this.ctx.beginPath();
+                    this.ctx.arc(cp.pos.x, cp.pos.y, cp.fixed ? 8 : 10, 0, Math.PI * 2);
+                    this.ctx.fill();
+
+                    // Draw outline
+                    this.ctx.strokeStyle = '#fff';
+                    this.ctx.lineWidth = 2;
+                    this.ctx.stroke();
+
+                    // Label
+                    this.ctx.fillStyle = '#fff';
+                    this.ctx.font = '12px Courier New';
+                    this.ctx.fillText(`P${i}`, cp.pos.x + 15, cp.pos.y + 5);
+                });
+            }
+
+            updatePhysics(dt) {
+                this.points.forEach(cp => cp.update(dt));
+            }
+
+            updateFPS() {
+                this.frameCount++;
+                const now = performance.now();
+                const elapsed = now - this.lastTime;
+
+                if (elapsed >= 1000) {
+                    this.fps = Math.round((this.frameCount * 1000) / elapsed);
+                    this.frameCount = 0;
+                    this.lastTime = now;
+                    document.getElementById('fps').textContent = `FPS: ${this.fps}`;
+                }
+            }
+
+            animate() {
+                const now = performance.now();
+                const dt = Math.min((now - (this.prevTime || now)) / 1000, 0.1);
+                this.prevTime = now;
+
+                this.updatePhysics(dt);
+                this.clear();
+                this.drawCurve();
+                this.drawTangents();
+                this.drawControlPoints();
+                this.updateFPS();
+
+                requestAnimationFrame(() => this.animate());
+            }
+        }
+
+        // Initialization
+        window.addEventListener('DOMContentLoaded', () => {
+            const canvas = document.getElementById('canvas');
+            new BezierRenderer(canvas);
+        });
+
+        window.addEventListener('resize', () => {
+            location.reload();
+        });
+    </script>
+</body>
+</html>
